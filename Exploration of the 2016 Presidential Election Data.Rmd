@@ -1,0 +1,411 @@
+---
+title: "Exploration of the 2016 Presidential Election Data"
+author: "Tien Huynh, Stephanie Sun, Nate Soeth, Michelle Li"
+output: pdf_document
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = F, 
+                      message = F,
+                      warning = F,
+                      fig.align = 'center',
+                      fig.height = 4, 
+                      fig.width = 4)
+
+# libraries here
+library(tidyverse)
+library(modelr)
+library(gbm)
+library(ROCR)
+library(pander)
+library(ggmap)
+library(maps)
+library(randomForest)
+library(tree)
+```
+# Introduction
+The 2016 presidential election demonstrates the complex nature of predicting voter behavior, as Donald Trump was elected to be the 45th president of the United States of America despite the numerous prediction polls projecting a Clinton victory. Even Nate Silver, the founder of FiveThirtyEight who correctly predicted the winner in all fifty states and the District of Columbia in the 2012 presidential election, failed to predict Trump’s win. According to the FiveThirtyEight website, accumulated errors, which were distributed rather unevenly among all the polls, lead to this inaccurate prediction. FiveThirtyEight also believes that the Democrats' turnout problem in addition to the Shy Tory effect played a huge factor. In our project, we will explore the census data with 2016 voting data to analyze the election outcome and better understand the process of predicting and interpreting voter behavior.
+
+Before starting our project, we gathered background information to guide our understanding of predicting voter behavior. Specifically, we researched Nate Silver's approach in 2012 that allowed him to achieve his outstanding prediction. It turns out that his approach incorporated a full range of probabilities instead of simply looking at the maximum probability. To do so, he calculated the probability of each percentage support for Obama in each state to consider how much of this probability is above 50%. As a result, he used Bayes Theorem and graph theory to calculate the new probabilities of each level of support. He also applied hierarchical modeling, which allowed information to move around his model.
+
+After researching for more information about predicting voter behavior, we planned and conducted our project. This project first reflects our attempt to predict the winner of the popular vote. By fitting separate linear regression models, we managed to predict the votes for Trump with only a 1.2% error and Clinton with a 8.6% error at the county level. We also concluded that Clinton won the popular vote after summing the predicted votes for each candidate. In addition, our project demonstrates our attempt to identify variables that are significant in the predictions by fitting a random forest model. Subsequently, we discovered that census variables such as White, Minority, and Transit are important associations. 
+
+# Materials and methods
+## Datasets
+```{r, echo=FALSE, results='hide'}
+# pre-processing of the datasets; will not be shown in actual project
+
+load('data/project_data.RData')
+
+# filter out fips == 2000
+election_raw <- election_raw %>%
+                filter(fips != '2000')
+
+# create one dataframe per observational unit
+election_raw$county[election_raw$fips == '46102'] <- 'Oglala Lakota County'
+election_federal <- election_raw %>%
+                    filter(fips == 'US')
+election_state <- election_raw %>%
+                  filter(is.na(county), fips != 'US', fips != '46102')
+election <- election_raw %>%
+            filter(!is.na(county))%>%
+            mutate(fips = as.numeric(fips))
+
+# clean census data
+census_clean <- census %>% drop_na() %>%
+          mutate(Men = Men/TotalPop*100, 
+                 Women = Women/TotalPop*100, 
+                 Employed = Employed/TotalPop*100, 
+                 Citizen = Citizen/TotalPop*100,
+                 Minority = Hispanic+Black+Native+Asian+Pacific)%>%
+          select(-c(Men, Hispanic, Black, Native, Asian, Pacific, Income, Walk, PublicWork, Construction)) %>%
+          select(!contains('Err'))
+
+# compute population-weighted quantitative variables
+census_clean_weighted <- census_clean %>%
+  group_by(State, County) %>%
+  add_tally(TotalPop, name = "CountyPop") %>%
+  mutate(pop_wt =TotalPop/CountyPop) %>%
+  mutate(across(TotalPop:Minority, ~ .x*pop_wt)) %>%
+  ungroup() %>%
+  select(-c(pop_wt, TotalPop, CountyPop))
+
+# aggregate to county level
+census_tidy <- census_clean_weighted %>%
+  select(-CensusTract) %>%
+  group_by(State, County) %>%
+  mutate(across(Women:Minority, sum)) %>%
+  ungroup() %>% distinct(County, .keep_all = T)
+
+# clean up environment
+rm(list = setdiff(ls(), c('election', 'election_state', 'election_federal', 'census_tidy')))
+
+# plotting boundaries for US states
+states <- map_data("state")
+name2abb <- function(statename){
+  ix <- match(statename, tolower(state.name))
+  out <- state.abb[ix]
+  return(out)
+}
+states <- states %>% 
+  mutate(fips = name2abb(region))
+
+# who won each state?
+state_winner <- election_state %>% # this line depends on your results above!
+  group_by(fips) %>% 
+  mutate(total = sum(votes), 
+         pct = votes/total) %>% 
+  slice_max(pct)
+
+# plotting boundaries for US counties
+county <- map_data("county")
+fips <- maps::county.fips %>%
+  separate(polyname, c('region', 'subregion'), sep = ',')
+county <- county %>% left_join(fips)
+
+# who won each county?
+county_winner <- election %>% # this line depends on your results above!
+  group_by(fips) %>% 
+  mutate(total = sum(votes), 
+         pct = votes/total) %>% 
+  slice_max(pct)
+
+# center and scale
+
+x_mx <- census_tidy %>% 
+  select(-c('State', 'County')) %>% 
+  scale(center = T, scale = T)
+
+# compute loadings for PC1 and PC2
+x_svd <- svd(x_mx)
+
+v_svd <- x_svd$v
+
+z_mx <- x_mx %*% x_svd$v
+
+county <- map_data("county") %>%
+  mutate_at(.vars = 'region', funs(sub("(.)", "\\U\\1", ., perl=TRUE))) %>%
+  mutate_at(.vars = 'subregion', funs(sub("(.)", "\\U\\1", ., perl=TRUE)))
+fips <- maps::county.fips %>%
+  separate(polyname, c('region', 'subregion'), sep = ',') %>%
+  mutate_at(.vars = 'region', funs(sub("(.)", "\\U\\1", ., perl=TRUE))) %>%
+  mutate_at(.vars = 'subregion', funs(sub("(.)", "\\U\\1", ., perl=TRUE)))
+county <- county %>% left_join(fips)
+
+fips <- rename(fips, State = region, County = subregion)
+
+# who won each county?
+fips$County <- gsub('\\s+', '', fips$County)
+fips$County <- tolower(fips$County)
+fips$County <- str_replace_all(fips$County, "[^[:alnum:]]", "")
+fips$State <- str_replace_all(fips$State, "[^[:alnum:]]", "")
+fips$State <- gsub('\\s+', '', fips$State)
+fips$State <- tolower(fips$State)
+
+poverty <- census_tidy %>% 
+  select('State', 'County', 'Poverty')
+
+poverty$County <- str_replace_all(poverty$County, "[^[:alnum:]]", "")
+poverty$County <- gsub('\\s+', '', poverty$County)
+poverty$County <- tolower(poverty$County)
+poverty$State <- str_replace_all(poverty$State, "[^[:alnum:]]", "")
+poverty$State <- gsub('\\s+', '', poverty$State)
+poverty$State <- tolower(poverty$State)
+
+poverty <- left_join(poverty, fips, by = "County")
+
+# define function to coerce state abbreviations to names
+abb2name <- function(stateabb){
+  ix <- match(stateabb, state.abb)
+  out <- tolower(state.name[ix])
+  return(out)
+}
+
+# top two candidates by county
+toptwo <- election %>% 
+  group_by(fips) %>% 
+  mutate(total = sum(votes), 
+         pct = votes/total) %>% 
+  slice_max(pct, n = 2)
+
+# create temporary dataframes with matching state/county information
+tmpelection <- toptwo %>%
+  ungroup %>%
+  # coerce names to abbreviations
+  mutate(state = abb2name(state)) %>%
+  # everything lower case
+  mutate(across(c(state, county), tolower)) %>%
+  # remove county suffixes
+  mutate(county = gsub(" county| columbia| city| parish", 
+                       "", 
+                       county)) 
+tmpcensus <- census_tidy %>% 
+  # coerce state and county to lowercase
+  mutate(across(c(State, County), tolower))
+
+# merge
+merged_data <- tmpelection %>%
+  left_join(tmpcensus, 
+            by = c("state"="State", "county"="County")) %>% 
+  na.omit()
+
+# clear temporary dataframes from environment
+rm(list = c('tmpwinner', 'tmpcensus'))
+
+
+#preprocessing of `merged_data`
+trump <- merged_data %>% filter(candidate == "Donald Trump") %>% select(-c(candidate, fips, county, pct, state, total))
+clinton <- merged_data %>% filter(candidate == "Hillary Clinton") %>% select(-c(candidate, fips, county, pct, state, total))
+```
+
+We start with two raw data sources – ‘census’ and ‘election_raw’. 
+
+‘election_raw’ is a dataset with 5 variables : ‘county’, ‘fips’, ‘candidate’, ‘state’, and  ‘votes’. Here, ’fips’ stands for Federal Information Processing Standard and denotes the area that each row of data represents. For county-level observations of ‘election_raw’, each row tells the reader how many votes a certain candidate gets in a certain county, the fips (numeric) correspond to that county, and the state where the county is located. For state-level observations of ‘election_raw’, each row tells the reader how many votes a certain candidate gets in a certain state, with the state name as the ‘fips’ value and NA for ‘county’. For federal-level observations of ‘election_raw’, each row tells the reader how many votes a certain candidate gets nationwide, with ‘US’ as the ‘fips’ value and NA for ‘county’.  ‘census’ is a dataset with 37 variables, including 'CensusTract’, ‘State’, ‘County’, ‘TotalPop’, ‘Men’, ‘Women’ and other variables describing the demographic of the area corresponding to the Census tract ID. 
+
+### Processing of ‘election_raw’
+
+We separate `election_raw` into separate federal-, state-, and county-level dataframes. Federal-level tallies are stored as `election_federal`, state-level tallies stored as `election_state`, and county-level tallies stored as `election`. Here we coerce the `fips` variable to numeric for `election`. 
+
+### Processing of ‘census’
+
+Since the `census` data contains high resolution information compared to  ‘election_raw’, in order to align ‘census’ with the election data, we need to aggregate it to the county level, which is the highest geographical resolution available in the election data. 
+
+Firstly, we clean up the census data and remove variables that are highly correlated. Specifically, we compute the `Minority` variable by summing `Hispanic`, `Black`, `Native`, `Asian`, `Pacific` and then remove these variables after creating `Minority`.  In addition, `Men`, `Income`, `Walk`, `PublicWork`, `Construction` and variables whose names end with `Err` (standard errors for estimated quantities) are removed from the ‘census’ dataset. The result is stored as `census_clean`.
+
+To aggregate the clean census data to the county level, we weight the variables by population. We group `census_clean` by `State` and `County`, and add a `CountyPop` variable with the population. Then, we calculate the proportion of the county population in each census tract, and multiply all quantitative variables by that proportion for each observation. The result is stored as `census_clean_weighted`. Lastly, we group `census_clean_weighted` by state and county, and then compute population-weighted averages of each variable by taking the sum of each quantitative variable. The result is stored as `census_tidy` and contains county-level demographic information. 
+
+### Merging the data 
+
+To combine the election and census data, we select the top two candidates by county from the `election` and store them as a separate data frame, and then we merge the top two data with the census data by state and county. The result is stored as `merged_data`, and we will use this data frame for modeling and analyzing the outcomes in later sections. 
+
+### Processing of `merged_data` for task 1
+
+For task 1, we create two data frames: `trump` and `clinton` from `merged_data`, one only contains the information about Trump and another about Clinton. ‘fips', 'county', 'pct', 'candidate', 'total' and 'state' are dropped from the two dataframes. Then both data frames are partitioned into a training and a testing set.
+
+#### Trump
+```{r}
+trump[,1:7] %>% head(3) %>% pander()
+```
+
+#### Clinton
+```{r}
+clinton[,1:7] %>% head(3) %>% pander()
+```
+
+
+### Processing of `merged_data` for task 2
+For task 2, we added a factor to `merged_data` that has the levels "Trump" and "Clinton" to indicate who wins the county, and ‘fips', 'pct', 'county', 'state', 'total' and 'votes' are dropped from the dataframe. Then the data frame is partitioned into a training and a testing set. 
+
+```{r}
+merged_data <- merged_data %>% 
+  group_by(fips) %>% 
+  mutate(max = max(pct)) %>%
+  mutate(Result = ifelse(pct == max, 'win', 'lose')) %>%
+  ungroup
+merged_data$county <- factor(merged_data$county)
+merged_data$state <- factor(merged_data$state)
+merged_data$Result <- factor(merged_data$Result)
+merged_data <- merged_data[c(1:29, 31)]
+
+merged_data <- merged_data %>% filter(Result == "win")
+merged_data <- merged_data %>% filter(candidate == "Donald Trump" | candidate == "Hillary Clinton")
+
+#Dropping Unnecessary Columns
+merged_data <- merged_data %>%
+          select(-c(county, state, fips, pct, total, votes, Result)) %>% drop_na()
+
+merged_data$candidate <- factor(merged_data$candidate)
+
+merged_data[,1:7] %>% head(3) %>% pander()
+```
+
+
+## Methods
+### Task 1
+To predict the winner of the popular vote, we fit separate linear regression models to predict the votes for Trump and Clinton respectively at county level, and sum the votes that each candidate gets to decide who is the winner of the popular vote. The response variable is 'votes', which is the votes that each candidate gets at county level, and we drop 'total', 'fips', 'pct', 'candidate', 'county' and 'state' from `merged_data`, as they might not be very helpful in constructing the models.
+Parameters of the linear regression models were estimated by regressing votes on the remaining variables using the training partition (80% of the data), and predictive accuracy was assessed on the whole dataset.
+To look at the relationships between the variables and response visually, we construct two separate set of scatterplots of log of the votes against the log of each variables for Trump and Clinton.  
+
+### Task2
+
+To identify variables that are significant in the predictions, we created a random forest model using the factor "candidate" from merged_data as the response variable. Before conducting the random forest, we dropped 'total', 'fips', 'pct', 'county' and 'state' from `merged_data`, as they might not be very helpful in constructing the models. We then calculated the importance for each variable left in the model, and created a dataframe sorting them from highest importance to lowest.
+
+Additionally, we used the random forest to create a prediction on the test partition to see how accurate the method may be, and we displayed the misclassification error rates in a table for interpretation.
+
+## Results
+
+### Task 1
+```{r,echo = F}
+set.seed(41221)
+
+#test/train splitting 
+trump_part <- resample_partition(data = trump, p = c(test = 0.2, train = 0.8))
+clinton_part <- resample_partition(data = clinton, p = c(test = 0.2, train = 0.8))
+
+#fitting separate linear regression models for Trump and Clinton
+fit_lm_trump <- lm(votes ~ ., data = trump_part$train)
+fit_lm_clinton <- lm(votes ~ ., data = clinton_part$train)
+
+#Predict the winner of the popular vote
+prediction_trump <- predict(fit_lm_trump, newdata = trump, interval = "prediction")
+prediction_clinton <- predict(fit_lm_clinton, newdata = clinton, interval = "prediction")
+winner <- ifelse(sum(prediction_trump[,1])>sum(prediction_clinton[,1]), "Trump", "Clinton")
+
+#print the predictions and actual votes 
+trump_predicted_votes = sum(prediction_trump[,1])
+trump_actual_votes = sum(trump$votes)
+percent_error_trump <- abs((sum(trump$votes)-sum(prediction_trump[,1]))/sum(prediction_trump[,1])*100)
+
+clinton_predicted_votes = sum(prediction_clinton[,1])
+clinton_actual_votes = sum(clinton$votes)
+percent_error_clinton <- abs((sum(clinton$votes)-sum(prediction_clinton[,1]))/sum(prediction_clinton[,1])*100)
+
+tab <- matrix(c(trump_predicted_votes, trump_actual_votes,percent_error_trump, clinton_predicted_votes, clinton_actual_votes, percent_error_clinton), ncol=3, byrow=TRUE)
+colnames(tab) <- c('Predicted Votes','Actual Votes', 'Percent Error')
+rownames(tab) <- c('Trump','Clinton')
+tab <- as.data.frame(tab)
+tab
+
+cat("Predicted winner:", winner, "\n")
+```
+Thus, the predicted winner is Clinton. 
+
+```{r}
+#print the summaries of the linear regression models
+summary(fit_lm_trump)
+summary(fit_lm_clinton)
+```
+
+#### Trump's model:
+
+Looking at the p-values for the variables, White, Citizen, Professional, Service, Office, MeanCommute, Minority  seems to be the most important predictors as we reject the null hypothesis for these variables (using a significance level of 0.05)
+
+Looking at the coefficient estimates, Women, White, Citizen, ChildPoverty, IncomePerCap, Poverty, Carpool, Employed, OtherTransp and Minority are inversely related to the votes that Trump gets, whereas other variables are positively related to votes. For example, a one percent increase in Poverty will decrease Trump's votes by approximately 434, and a one percent increase in SelfEmployed will increase Trump's vote by approximately 763 
+
+#### Clinton's model:
+
+Looking at the p-values for the variables, White, Citizen, Professional, Service, Office, Production, Transit, MeanCommute, PrivateWork, selfEmployed and Minority seems to be the most important predictors as we reject the null hypothesis for these variables (using a significance level of 0.05)
+
+Looking at the coefficient estimates, Women, White, Citizen, ChildPoverty, Carpool, Employed and Minority are inversely related to the votes that Clinton gets, whereas other variables are positively related to votes. For example, a one percent increase in Poverty will increase Clinton's votes by approximately 184, and a one percent increase in Employed will decrease Clinton's vote by approximately 460.  
+
+```{r, fig.width = 15, fig.height = 15}
+feature_trump <- gather(trump, key = "features", value = "percent", "Women": "Minority")
+feature_clinton <- gather(clinton, key = "features", value = "percent", "Women": "Minority")
+ 
+p1 <- feature_trump%>%
+  ggplot(aes(x = log(percent), y = log(votes))) +
+  geom_point(aes(color = features), alpha = 0.5) +
+  facet_wrap(~features, scale = ("free")) +
+  geom_smooth(method="lm")
+
+p2 <- feature_clinton%>%
+  ggplot(aes(x = log(percent), y = log(votes))) +
+  geom_point(aes(color = features), alpha = 0.5) +
+  facet_wrap(~features, scale = ("free")) +
+  geom_smooth(method="lm")
+
+print(p1 + ggtitle("Trump"))
+print(p2 + ggtitle("Clinton"))
+```
+According to these graphs, FamilyWork, IncomePerCap, MeanCommute, PrivateWork, SelfEmployed seems to be linearly related to the votes for Trump. On the other hand, the previously mentioned in addition to Minority and Transit seems to be linearly related to the votes for Clinton. 
+
+\newpage
+### Task 2
+
+```{r, fig.width = 5, fig.height = 4}
+#Setting Seed
+set.seed(41221)
+
+#Creating Partitions
+sub_part <- resample_partition(merged_data, c(test = 0.2, train = 0.8))
+train <- as_tibble(sub_part$train)
+test <- as_tibble(sub_part$test)
+
+#Creating Random Forest
+
+fit_rf <- randomForest(formula = candidate ~ ., ntree = 100, mtry = 5, data = train, 
+                       importance = T)
+
+#Finding Importance Values
+importance <- as.data.frame(fit_rf$importance)
+
+importance <- importance[with(importance, order(-MeanDecreaseAccuracy)), ]
+
+importance <- as.data.frame(select(importance, MeanDecreaseAccuracy))
+importance <- importance %>% rename(Accuracy = MeanDecreaseAccuracy)
+importance %>% pander()
+
+#Importance Graph
+fit_rf$importance %>% 
+  as_tibble() %>%
+  mutate(var = factor(rownames(fit_rf$importance)),
+         total_sd = fit_rf$importanceSD[ , 3]) %>%
+  rename(Total = MeanDecreaseAccuracy) %>%
+  ggplot(aes(y = fct_reorder(var, Total), x = Total)) +
+  geom_point() +
+  geom_errorbarh(aes(xmin = Total - 2*total_sd, xmax = Total + 2*total_sd)) +
+  theme_bw() +
+  labs(x = 'Mean decrease in misclassification rate across trees', y = '') +
+  ggtitle("Importance of Variables in Census Data")
+```
+
+The importance table and graph both clearly show that the variables "White", "Minority", and "Transit" are the most significant when it comes to this particular model. Each has an importance value of at least 0.03, while the next highest is "Employed" at 0.01236.
+
+```{r}
+#Predictions
+preds_test_topt <- predict(fit_rf, sub_part$test, type = 'class')
+
+#Misclassification Errors
+classes_test <- as.data.frame(sub_part$test) %>% pull(candidate)
+test_errors_topt <- table(class = classes_test, pred = preds_test_topt)
+error_rates <- test_errors_topt/rowSums(test_errors_topt)
+
+as.data.frame(error_rates) %>% pander()
+```
+
+The misclassification error table tells us that this model actually favors Donald Trump, unlike most of the models done prior to the 2016 election. This model correctly predicted Donald Trump in about 97% of cases, while it correctly predicted Hillary Clinton in only about 86% of cases. This means that in about 14% of cases, the model predicted Donald Trump, when the actual outcome was Hillary Clinton, and in only 2% of cases did the model predict Hillary Clinton when the actual outcome was Donald Trump.
+
+# Discussion
+While our project was focused on exploring and predicting voter behavior using data from the US census and the 2016 presidential election as a whole, it can be further explored by analyzing and predicting voter trends within a certain demographic, such as among women and minorities. A review of the results given by Task 1 outlines the magnitude to which each variable affects the candidates' number of votes while Task 2’s results outline the accuracy of our model’s predictions and reveals that the White, Minority, and Transit are the most statistically significant variables in our prediction model. Looking and drawing conclusions from these studies can assist politicians, such as by determining where they need to do more canvassing to swing a county towards a certain political party. It can also highlight inequalities (ex. income, education, etc.) present in geographical areas, and social workers can utilize this information to determine where to allocate more aid to. 
+
